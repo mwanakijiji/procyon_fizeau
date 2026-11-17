@@ -10,8 +10,8 @@ from astropy.io import fits
 #import sys
 import glob, os
 
-stem_read = '/Volumes/One Touch/procyon_fizeau_2023B/raw_data/'
-stem_write = '/Volumes/One Touch/procyon_fizeau_2023B/01_dark_subtracted/'
+stem_read = '/data/procyon_fizeau_2023B/raw_data/'
+stem_write = '/data/procyon_fizeau_2023B/01_dark_subtracted/'
 
 master_dark_file = '/Volumes/One Touch/procyon_fizeau_2023B/calib_files/dark_median.fits'
 
@@ -23,6 +23,7 @@ with fits.open(master_dark_file) as hdul_dark:
     print(np.shape(master_dark))
 
 for t in range(100, len(file_list)):
+
     file_name = file_list[t]
     print(file_name)
     with fits.open(file_name) as hdul:
