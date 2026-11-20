@@ -14,7 +14,7 @@ Examples:
     # build the region PCA bases (needed once per dataset, after bkg_channel)
     python scripts/run_preprocess.py --dataset procyon_240131 --stages train_regions
 
-Stages (in order): slope, dark, ramp, bkg_nod, bkg_channel, train_regions, bkg_regions,
+Stages (in order): slope, dark, badpix, ramp, bkg_nod, bkg_channel, train_regions, bkg_regions,
 fuse, cutout, register, crop. By default all run except the optional bkg_nod and
 train_regions.
 """
@@ -31,7 +31,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-STAGES = ["slope", "dark", "ramp", "bkg_nod", "bkg_channel", "train_regions",
+STAGES = ["slope", "dark", "badpix", "ramp", "bkg_nod", "bkg_channel", "train_regions",
           "bkg_regions", "fuse", "cutout", "register", "crop"]
 DEFAULT_STAGES = [s for s in STAGES if s not in ("bkg_nod", "train_regions")]
 
