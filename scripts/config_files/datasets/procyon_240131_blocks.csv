@@ -1,0 +1,20 @@
+# Blocks of the LBT/LMIRcam Fizeau night of UT 2024 Jan. 31 (Procyon).
+# One row per block: a run of consecutive frame numbers with the same target, filter
+# and nod position. Ranges are inclusive. See modules/shared/dataset.py for the columns.
+# Frame ranges, filters and the dark (FW4 = Blank) are from the FITS headers
+# (dev_notebooks/procyon_fits_header_info.csv). filter: FW4, plus FW2 where it is not Open.
+# quadrant: detector region holding the star (names from [regions] in procyon_240131.ini);
+#   blank where the star is not on the detector (10501-11500, the off-source nod)
+#   PLACEHOLDER: region A is a placeholder region (see [regions])
+# star_y, star_x: approximate star position on the 512 x 2048 frame, from the peak of
+#   box-smoothed dark-subtracted frames sampled across each block; the star is not
+#   seen in any sampled frame of 10501-11500
+# use: False marks frames that are not science (the darks). No other frames have
+#   been vetted yet. (Star flux in 11501-11800 drops to about the noise from ~11660 on,
+#   under clouds.)
+frame_start,frame_stop,target,filter,quadrant,star_y,star_x,use
+1,500,Procyon,Br-Alpha-On+ND1.0-T10,A,142,901,True
+501,10500,Procyon,Br-Alpha-On,A,138,915,True
+10501,11500,Procyon,Br-Alpha-On,,,,True
+11501,11800,Procyon,Br-Alpha-On,A,138,915,True
+11801,12800,dark,Blank,,,,False

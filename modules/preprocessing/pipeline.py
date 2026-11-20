@@ -1,27 +1,30 @@
 """
-Preprocessing stages, in order, driven by scripts/run_preprocess.py.
+Preprocessing stages, driven by scripts/run_preprocess.py.
 
-Stage          reads                        writes
--------------  ---------------------------  ---------------------------------------
-slope          DIR_RAW_DATA                 DIR_SLOPE_FRAMES
-dark           DIR_SLOPE_FRAMES             DIR_DARK_SUBTED         (skipped if DARK_MASTER = None)
-badpix         DIR_DARK_SUBTED (or _SLOPE_) DIR_PIXL_CORRTD         (skipped if BADPIX_MASTER = None)
-ramp           newest of the above          DIR_RAMP_REMOVED
-bkg_nod        DIR_RAMP_REMOVED             DIR_NOD_SUBTED          (optional)
-bkg_channel    DIR_RAMP_REMOVED or _NOD_    DIR_PCAB_SUBTED
-train_regions  DIR_PCAB_SUBTED              REGION_PCA_CUBE files   (when the cubes are missing)
-bkg_regions    DIR_PCAB_SUBTED              DIR_PCAB_SUBTED_REGION (one per region)
-fuse           DIR_PCAB_SUBTED_REGION       DIR_ALL_QUADS_RECOMBINED
-cutout         DIR_ALL_QUADS_RECOMBINED     DIR_CUTOUT_FRAMES       (first of CUTOUT_SIZES)
-register       DIR_CUTOUT_FRAMES            DIR_REGISTERED_FRAMES   (first size)
-crop           DIR_REGISTERED_FRAMES        DIR_REGISTERED_FRAMES   (other sizes)
+Stage          does
+-------------  -----------------------------------------------------------------------
+slope          2D frames from the raw readouts
+dark           subtract the master dark (DARK_MASTER)
+badpix         interpolate over the bad pixels (BADPIX_MASTER)
+ramp           remove stray-illumination ramps
+bkg_nod        subtract the median of nearby opposite-nod frames
+bkg_channel    subtract channel-pedestal PCA backgrounds
+train_regions  build each region's PCA basis cube in DIR_CALIB_FRAMES (only if missing,
+               unless RETRAIN_REGION_PCA)
+bkg_regions    subtract each region's PCA background (one directory per region)
+fuse           fuse the regions into whole frames
+cutout         cutouts centered on the star (first of CUTOUT_SIZES)
+register       register the cutouts within each block
+crop           crop the registered frames to the other CUTOUT_SIZES
+
+Which stages are in the chain, which run now, and the directories they read and write are
+set by the ``[pipeline]`` and ``[stage_dirs]`` config sections (see
+modules/preprocessing/stage_plan.py): each stage reads the output of the previous enabled
+stage, and outputs go to DIR_WRITE/<NN>_<stem>/, numbered over the enabled stages.
 
 slope, dark, badpix and ramp process every frame in their input directory. From bkg_nod
 on, only frames in blocks with use = True are processed; cutout, register and crop further
 skip blocks with no star on the detector (blank ``quadrant`` in the blocks CSV).
-
-ramp reads DIR_PIXL_CORRTD if the badpix stage is enabled, else DIR_DARK_SUBTED if the dark
-stage is, else DIR_SLOPE_FRAMES.
 
 Adapted from modules/preprocessing/pipeline.py of the AB Aur pipeline.
 """
@@ -29,6 +32,7 @@ Adapted from modules/preprocessing/pipeline.py of the AB Aur pipeline.
 import glob
 import logging
 import os
+import shutil
 from multiprocessing import get_context
 
 import numpy as np
@@ -48,10 +52,7 @@ from modules.preprocessing.region_pca import train_region_pca
 from modules.preprocessing.cutouts import CutoutSingle
 from modules.preprocessing.crop import crop_fits_dir
 from modules.preprocessing.star import block_has_star
-
-STAGES = ["slope", "dark", "badpix", "ramp", "bkg_nod", "bkg_channel", "train_regions",
-          "bkg_regions", "fuse", "cutout", "register", "crop"]
-DEFAULT_STAGES = [s for s in STAGES if s not in ("bkg_nod", "train_regions")]
+from modules.preprocessing.stage_plan import STAGES, StagePlan  # noqa: F401 (STAGES re-exported)
 
 # the callable run by pool workers; set before the pool is forked, so workers inherit it
 # instead of having it (and e.g. a large PCA cube) pickled with every task
@@ -118,37 +119,11 @@ class Pipeline:
         self.sizes = [int(s) for s in config["dataset"]["CUTOUT_SIZES"].split(",")]
         self.psf_radius = self.pp.getfloat("PSF_MASK_RADIUS")
         self.halfbox = self.pp.getint("STAR_SEARCH_HALFBOX")
-        self.use_nod = self.pp.getboolean("USE_NOD_SUBTRACTION")
-        # DARK_MASTER = None skips dark subtraction; ramp then reads the slope frames
-        self.use_dark = config["file_names"]["DARK_MASTER"].strip() != "None"
-        # BADPIX_MASTER = None (or absent) skips bad-pixel fixing
-        self.use_badpix = config["file_names"].get("BADPIX_MASTER", "None").strip() != "None"
+        # which stages run, and the directories they read and write
+        self.plan = StagePlan.from_config(config, regions=list(self.regions))
+        self.use_nod = self.plan.enabled("bkg_nod")
 
     # ---------- helpers ----------
-
-    def _pre_badpix_dir(self):
-        '''
-        Input directory of the badpix stage.
-
-        INPUTS:
-        - None
-
-        OUTPUTS:
-        - path (str): DIR_DARK_SUBTED if the dark stage is enabled, else DIR_SLOPE_FRAMES
-        '''
-        return self.dirs["DIR_DARK_SUBTED"] if self.use_dark else self.dirs["DIR_SLOPE_FRAMES"]
-
-    def _pre_ramp_dir(self):
-        '''
-        Input directory of the ramp stage (output of the last enabled stage before it).
-
-        INPUTS:
-        - None
-
-        OUTPUTS:
-        - path (str): DIR_PIXL_CORRTD if the badpix stage is enabled, else ``_pre_badpix_dir()``
-        '''
-        return self.dirs["DIR_PIXL_CORRTD"] if self.use_badpix else self._pre_badpix_dir()
 
     def _in_ranges(self, n):
         '''
@@ -269,9 +244,9 @@ class Pipeline:
         - region (str): Region name (from the dataset config)
 
         OUTPUTS:
-        - path (str): ``DIR_PCAB_SUBTED_REGION`` with ``{region}`` filled in
+        - path (str): Numbered ``bkg_regions`` directory with ``{region}`` filled in
         '''
-        return self.dirs["DIR_PCAB_SUBTED_REGION"].format(region=region)
+        return self.plan.out_dir("bkg_regions", region=region)
 
     def region_cube_path(self, region):
         '''
@@ -296,9 +271,9 @@ class Pipeline:
         - None
 
         OUTPUTS:
-        - path (str): ``DIR_CUTOUT_FRAMES`` with ``{size}`` filled in
+        - path (str): Numbered ``cutout`` directory with ``{size}`` filled in
         '''
-        return self.dirs["DIR_CUTOUT_FRAMES"].format(size=self.sizes[0])
+        return self.plan.out_dir("cutout", size=self.sizes[0])
 
     def registered_dir(self, size):
         '''
@@ -308,9 +283,9 @@ class Pipeline:
         - size (int): Cutout side (pix)
 
         OUTPUTS:
-        - path (str): ``DIR_REGISTERED_FRAMES`` with ``{size}`` filled in
+        - path (str): Numbered ``register`` directory with ``{size}`` filled in
         '''
-        return self.dirs["DIR_REGISTERED_FRAMES"].format(size=size)
+        return self.plan.out_dir("register", size=size)
 
     def calib(self, key):
         '''
@@ -327,20 +302,44 @@ class Pipeline:
             raise FileNotFoundError(f"Calibration file {key} not found: {path}")
         return path
 
-    def run(self, stages):
+    def clobber(self):
         '''
-        Run the given stages in order (each must be in ``STAGES``).
+        Delete the output directories of the stages that run (``StagePlan.clobber_dirs``).
+        Calibration files (dark, bad-pixel mask, PCA cubes) are never touched.
 
         INPUTS:
-        - stages (list of str): Stage names
+        - None
 
         OUTPUTS:
         - None
         '''
-        for stage in stages:
-            if stage not in STAGES:
-                raise ValueError(f"Unknown stage {stage!r}; choose from {STAGES}")
-        for stage in stages:
+        dirs = [d for d in self.plan.clobber_dirs() if os.path.isdir(d)]
+        if not dirs:
+            logging.info("CLOBBER: no existing output directories to delete")
+            return
+        if self.frame_ranges is not None or self.sample_frames is not None:
+            logging.warning("CLOBBER deletes whole directories, although --frames/--sample "
+                            "restrict which frames are reprocessed")
+        for d in dirs:
+            n = sum(len(files) for _, _, files in os.walk(d))
+            logging.info(f"CLOBBER: deleting {d} ({n} files)")
+            shutil.rmtree(d)
+
+    def run(self):
+        '''
+        Run the stages of the plan from START_STAGE on (``plan.to_run``), after deleting their
+        output directories first if CLOBBER is True.
+
+        INPUTS:
+        - None
+
+        OUTPUTS:
+        - None
+        '''
+        logging.info("Stage plan:\n" + self.plan.describe())
+        if self.plan.clobber:
+            self.clobber()
+        for stage in self.plan.to_run:
             logging.info(f"=== stage {stage} ===")
             getattr(self, f"stage_{stage}")()
 
@@ -349,7 +348,7 @@ class Pipeline:
     def stage_slope(self):
         '''
         Make 2D frames from the raw readouts: slope frames from 2-read cubes, or the single read
-        of 1-read cubes (DIR_RAW_DATA -> DIR_SLOPE_FRAMES).
+        of 1-read cubes (directories from the stage plan; slope normally reads DIR_RAW_DATA).
 
         INPUTS:
         - None
@@ -358,13 +357,13 @@ class Pipeline:
         - None
         '''
         logging.info('Making 2D frames from the raw readouts...')
-        fn = make_slope_frames.MakeSlopeFrameSingle(write_dir=self.dirs["DIR_SLOPE_FRAMES"], config=self.config)
-        self.map(fn, self.files(self.dirs["DIR_RAW_DATA"]), self.dirs["DIR_SLOPE_FRAMES"])
+        out = self.plan.out_dir("slope")
+        fn = make_slope_frames.MakeSlopeFrameSingle(write_dir=out, config=self.config)
+        self.map(fn, self.files(self.plan.in_dir("slope")), out)
 
     def stage_dark(self):
         '''
-        Subtract the master dark (DIR_SLOPE_FRAMES -> DIR_DARK_SUBTED); skipped if DARK_MASTER
-        is None.
+        Subtract the master dark (DARK_MASTER).
 
         INPUTS:
         - None
@@ -372,19 +371,15 @@ class Pipeline:
         OUTPUTS:
         - None
         '''
-        if not self.use_dark:
-            logging.info('DARK_MASTER is None; skipping dark subtraction')
-            return
         logging.info('Dark-subtracting frames...')
-        fn = dark_subtract.DarkSubtSingle(write_dir=self.dirs["DIR_DARK_SUBTED"],
-                                          master_dark=self.calib("DARK_MASTER"), config=self.config)
-        self.map(fn, self.files(self.dirs["DIR_SLOPE_FRAMES"]), self.dirs["DIR_DARK_SUBTED"])
+        out = self.plan.out_dir("dark")
+        fn = dark_subtract.DarkSubtSingle(write_dir=out, master_dark=self.calib("DARK_MASTER"),
+                                          config=self.config)
+        self.map(fn, self.files(self.plan.in_dir("dark")), out)
 
     def stage_badpix(self):
         '''
-        Interpolate over the pixels in the master bad-pixel mask (DIR_DARK_SUBTED, or
-        DIR_SLOPE_FRAMES if DARK_MASTER is None -> DIR_PIXL_CORRTD); skipped if BADPIX_MASTER
-        is None.
+        Interpolate over the pixels in the master bad-pixel mask (BADPIX_MASTER).
 
         INPUTS:
         - None
@@ -392,17 +387,15 @@ class Pipeline:
         OUTPUTS:
         - None
         '''
-        if not self.use_badpix:
-            logging.info('BADPIX_MASTER is None; skipping bad-pixel fixing')
-            return
         logging.info('Fixing bad pixels...')
-        fn = fix_bad_pix.FixPixSingle(write_dir=self.dirs["DIR_PIXL_CORRTD"],
-                                      master_bad_pix_file=self.calib("BADPIX_MASTER"), config=self.config)
-        self.map(fn, self.files(self._pre_badpix_dir()), self.dirs["DIR_PIXL_CORRTD"])
+        out = self.plan.out_dir("badpix")
+        fn = fix_bad_pix.FixPixSingle(write_dir=out, master_bad_pix_file=self.calib("BADPIX_MASTER"),
+                                      config=self.config)
+        self.map(fn, self.files(self.plan.in_dir("badpix")), out)
 
     def stage_ramp(self):
         '''
-        Remove stray-illumination ramps (``_pre_ramp_dir()`` -> DIR_RAMP_REMOVED).
+        Remove stray-illumination ramps.
 
         INPUTS:
         - None
@@ -411,15 +404,14 @@ class Pipeline:
         - None
         '''
         logging.info('Removing stray illumination ramps...')
-        read_dir = self._pre_ramp_dir()
-        fn = ramp_removal.RemoveStrayRamp(write_dir=self.dirs["DIR_RAMP_REMOVED"], config=self.config,
+        out = self.plan.out_dir("ramp")
+        fn = ramp_removal.RemoveStrayRamp(write_dir=out, config=self.config,
                                           psf_mask_radius=self.psf_radius)
-        self.map(fn, self.files(read_dir), self.dirs["DIR_RAMP_REMOVED"])
+        self.map(fn, self.files(self.plan.in_dir("ramp")), out)
 
     def stage_bkg_nod(self):
         '''
-        Subtract the median of nearby opposite-nod frames (DIR_RAMP_REMOVED -> DIR_NOD_SUBTED;
-        used frames only).
+        Subtract the median of nearby opposite-nod frames (used frames only).
 
         INPUTS:
         - None
@@ -428,19 +420,18 @@ class Pipeline:
         - None
         '''
         logging.info('Subtracting medians of opposite-nod frames...')
-        fn = NodSubtractSingle(write_dir=self.dirs["DIR_NOD_SUBTED"],
-                               files_by_frame=self.files_by_frame(self.dirs["DIR_RAMP_REMOVED"]),
+        read_dir, out = self.plan.in_dir("bkg_nod"), self.plan.out_dir("bkg_nod")
+        fn = NodSubtractSingle(write_dir=out,
+                               files_by_frame=self.files_by_frame(read_dir),
                                blocks=self.blocks, n_frames=self.pp.getint("NOD_N_FRAMES"),
                                psf_radius=self.psf_radius, halfbox=self.halfbox, prefix=self.prefix)
         # contiguous chunks, so each worker's cache of opposite-nod frames is reused
-        self.map(fn, self.files(self.dirs["DIR_RAMP_REMOVED"], used_only=True), self.dirs["DIR_NOD_SUBTED"],
-                 chunksize=64)
+        self.map(fn, self.files(read_dir, used_only=True), out, chunksize=64)
 
     def stage_bkg_channel(self):
         '''
-        Subtract channel-pedestal PCA backgrounds (DIR_RAMP_REMOVED, or DIR_NOD_SUBTED with nod
-        subtraction -> DIR_PCAB_SUBTED; used frames only). Builds the channel PCA cube, at the
-        shape of the input frames, if missing.
+        Subtract channel-pedestal PCA backgrounds (used frames only). Builds the channel PCA
+        cube in DIR_OTHER_FITS, at the shape of the input frames, if missing.
 
         INPUTS:
         - None
@@ -449,7 +440,7 @@ class Pipeline:
         - None
         '''
         logging.info('Subtracting channel-pedestal PCA backgrounds...')
-        read_dir = self.dirs["DIR_NOD_SUBTED"] if self.use_nod else self.dirs["DIR_RAMP_REMOVED"]
+        read_dir, out = self.plan.in_dir("bkg_channel"), self.plan.out_dir("bkg_channel")
         files = self.files(read_dir, used_only=True)
         if not files:
             logging.info(f"  no frames in {read_dir}")
@@ -459,15 +450,16 @@ class Pipeline:
             os.makedirs(os.path.dirname(cube), exist_ok=True)
             pca_backg_maker_channels_only(cube, read_frame(files[0])[0].shape)
         fn = BackgroundPCASubtSingle(
-            self.pp.getint("N_PCA_CHANNEL"), pca_cube_file=cube, write_dir=self.dirs["DIR_PCAB_SUBTED"],
+            self.pp.getint("N_PCA_CHANNEL"), pca_cube_file=cube, write_dir=out,
             mask=self.mask, config_data=self.config, psf_mask_radius=self.psf_radius,
             write_diagnostics=self.pp.getboolean("WRITE_BKG_DIAGNOSTICS"))
-        self.map(fn, files, self.dirs["DIR_PCAB_SUBTED"])
+        self.map(fn, files, out)
 
     def stage_train_regions(self):
         '''
-        Train the PCA background basis of each detector region from DIR_PCAB_SUBTED frames
-        (skips regions whose basis exists, if ``skip_existing``).
+        Train the PCA background basis of each detector region from the frames bkg_regions will
+        read. A region whose basis exists is skipped, unless RETRAIN_REGION_PCA is True
+        (independent of --overwrite and CLOBBER, so the bases are not rebuilt by accident).
 
         INPUTS:
         - None
@@ -476,12 +468,15 @@ class Pipeline:
         - None
         '''
         logging.info('Training PCA background bases for each detector region...')
-        files = self.files_by_frame(self.dirs["DIR_PCAB_SUBTED"])
+        retrain = self.pp.getboolean("RETRAIN_REGION_PCA", fallback=False)
+        files = None
         for name, region in self.regions.items():
             out = self.region_cube_path(name)
-            if self.skip_existing and os.path.exists(out):
+            if not retrain and os.path.exists(out):
                 logging.info(f"  region {name}: basis exists, skipping ({out})")
                 continue
+            if files is None:
+                files = self.files_by_frame(self.plan.in_dir("train_regions"))
             train_region_pca(files, self.blocks, name, region,
                              n_frames=self.pp.getint("N_TRAIN_FRAMES"),
                              n_pca=self.pp.getint("N_PCA_REGION"),
@@ -490,8 +485,8 @@ class Pipeline:
 
     def stage_bkg_regions(self):
         '''
-        Subtract each region's PCA background (DIR_PCAB_SUBTED -> one DIR_PCAB_SUBTED_REGION per
-        region; used frames only). The region bases must exist (train_regions).
+        Subtract each region's PCA background (one output directory per region; used frames
+        only). The region bases must exist (train_regions).
 
         INPUTS:
         - None
@@ -500,7 +495,7 @@ class Pipeline:
         - None
         '''
         logging.info('Subtracting region PCA backgrounds...')
-        files = self.files(self.dirs["DIR_PCAB_SUBTED"], used_only=True)
+        files = self.files(self.plan.in_dir("bkg_regions"), used_only=True)
         for name in self.regions:
             cube = self.region_cube_path(name)
             if not os.path.exists(cube):
@@ -516,8 +511,8 @@ class Pipeline:
 
     def stage_fuse(self):
         '''
-        Fuse the background-subtracted regions into whole frames (DIR_PCAB_SUBTED_REGION ->
-        DIR_ALL_QUADS_RECOMBINED), for frames present in every region directory.
+        Fuse the background-subtracted regions into whole frames, for frames present in every
+        region directory.
 
         INPUTS:
         - None
@@ -526,17 +521,18 @@ class Pipeline:
         - None
         '''
         logging.info('Fusing background-subtracted regions into whole frames...')
-        region_dirs = [self.region_dir(name) for name in self.regions]
+        region_dirs = [self.plan.in_dir("fuse", region=name) for name in self.regions]
         # frames present in every region directory
         names = set.intersection(*[set(map(os.path.basename, self.files(d, used_only=True))) for d in region_dirs])
         files = [os.path.join(region_dirs[0], n) for n in sorted(names)]
-        fn = FuseRegions(write_dir=self.dirs["DIR_ALL_QUADS_RECOMBINED"], region_dirs=region_dirs)
-        self.map(fn, files, self.dirs["DIR_ALL_QUADS_RECOMBINED"])
+        out = self.plan.out_dir("fuse")
+        fn = FuseRegions(write_dir=out, region_dirs=region_dirs)
+        self.map(fn, files, out)
 
     def stage_cutout(self):
         '''
-        Cut odd-sized cutouts centered on the star (DIR_ALL_QUADS_RECOMBINED ->
-        DIR_CUTOUT_FRAMES, first size in CUTOUT_SIZES; used frames with the star on the detector).
+        Cut odd-sized cutouts centered on the star (first size in CUTOUT_SIZES; used frames with
+        the star on the detector).
 
         INPUTS:
         - None
@@ -547,13 +543,13 @@ class Pipeline:
         logging.info('Making initial cutouts centered on the star...')
         fn = CutoutSingle(write_dir=self.cutout_dir(), blocks=self.blocks, prefix=self.prefix,
                           size=self.sizes[0], halfbox=self.halfbox)
-        self.map(fn, self.files(self.dirs["DIR_ALL_QUADS_RECOMBINED"], used_only=True, star_only=True),
+        self.map(fn, self.files(self.plan.in_dir("cutout"), used_only=True, star_only=True),
                  self.cutout_dir())
 
     def stage_register(self):
         '''
-        Register the cutouts within each block (DIR_CUTOUT_FRAMES -> DIR_REGISTERED_FRAMES of the
-        first size), one block per worker; blocks already fully registered are skipped if
+        Register the cutouts within each block (to the registered directory of the first
+        size), one block per worker; blocks already fully registered are skipped if
         ``skip_existing``. Logs a summary per block.
 
         INPUTS:
@@ -569,7 +565,7 @@ class Pipeline:
         write_dir = self.registered_dir(self.sizes[0])
         os.makedirs(write_dir, exist_ok=True)
         by_block = {}
-        for path in self.files(self.cutout_dir(), used_only=True, star_only=True):
+        for path in self.files(self.plan.in_dir("register", size=self.sizes[0]), used_only=True, star_only=True):
             b = block_for_frame(self.blocks, frame_number(path, self.prefix))
             by_block.setdefault(b.name, []).append(path)
         jobs = []
@@ -618,8 +614,8 @@ class Pipeline:
 
     def stage_crop(self):
         '''
-        Crop the registered frames to the other sizes in CUTOUT_SIZES (DIR_REGISTERED_FRAMES of the
-        first size -> DIR_REGISTERED_FRAMES of each other size), keeping the star at ((N-1)/2, (N-1)/2).
+        Crop the registered frames (first size) to the other sizes in CUTOUT_SIZES, written next
+        to them (registered directory of each other size), keeping the star at ((N-1)/2, (N-1)/2).
 
         INPUTS:
         - None
@@ -628,7 +624,7 @@ class Pipeline:
         - None
         '''
         logging.info('Cropping registered frames to the user-desired cutout sizes...')
-        src = self.registered_dir(self.sizes[0])
+        src = self.plan.in_dir("crop", size=self.sizes[0])
         for size in self.sizes[1:]:
             dst = self.registered_dir(size)
             names = {os.path.basename(p) for p in self.files(src, used_only=True, star_only=True)}

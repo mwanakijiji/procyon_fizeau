@@ -3,20 +3,19 @@
 Runs the preprocessing stages (see modules/preprocessing/pipeline.py) for one dataset,
 described by scripts/config_files/datasets/<name>.ini and its blocks CSV.
 
+Which stages run is set in the config, not on the command line: the ``[pipeline]`` section
+(True/False per stage, START_STAGE, START_DIR, CLOBBER) of the dataset .ini or of
+scripts/config_files/preprocess.ini. See modules/preprocessing/stage_plan.py.
+
 Examples:
-    # everything, for the Procyon dataset
+    # the stages enabled in the config, from START_STAGE on
     python scripts/run_preprocess.py --dataset procyon_240131
 
-    # background stages only, on one block from each nod
-    python scripts/run_preprocess.py --dataset procyon_240131 \\
-        --stages ramp,bkg_channel,bkg_regions,fuse --frames 501-600,10501-10600
+    # the same, on one block from each nod
+    python scripts/run_preprocess.py --dataset procyon_240131 --frames 501-600,10501-10600
 
-    # build the region PCA bases (needed once per dataset, after bkg_channel)
-    python scripts/run_preprocess.py --dataset procyon_240131 --stages train_regions
-
-Stages (in order): slope, dark, badpix, ramp, bkg_nod, bkg_channel, train_regions, bkg_regions,
-fuse, cutout, register, crop. By default all run except the optional bkg_nod and
-train_regions.
+    # the same, on 5 random good frames
+    python scripts/run_preprocess.py --dataset procyon_240131 --sample 5
 """
 import argparse
 import datetime
@@ -30,10 +29,6 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-STAGES = ["slope", "dark", "badpix", "ramp", "bkg_nod", "bkg_channel", "train_regions",
-          "bkg_regions", "fuse", "cutout", "register", "crop"]
-DEFAULT_STAGES = [s for s in STAGES if s not in ("bkg_nod", "train_regions")]
 
 
 def _limit_blas_threads(ncpu):
@@ -68,8 +63,6 @@ def main():
         epilog=__doc__.split("\n\n", 1)[1])
     parser.add_argument("--dataset", required=True,
                         help="dataset name in scripts/config_files/datasets/ (e.g. procyon_240131) or path to its .ini")
-    parser.add_argument("--stages", default=",".join(DEFAULT_STAGES),
-                        help=f"comma-separated stages from {','.join(STAGES)} (default: %(default)s)")
     parser.add_argument("--frames", default=None,
                         help="restrict to frame ranges, e.g. 501-600,10501-10600 (default: all)")
     parser.add_argument("--sample", type=int, default=None,
@@ -87,10 +80,8 @@ def main():
     # (so each worker process does not grab every core for itself)
     from modules.shared.dataset import load_dataset_config, parse_frame_ranges
     from modules.preprocessing import pipeline as pipeline_module
-    assert pipeline_module.STAGES == STAGES, "keep STAGES in run_preprocess.py and pipeline.py in sync"
 
     config = load_dataset_config(args.dataset)
-    stages = [s.strip() for s in args.stages.split(",") if s.strip()]
     frame_ranges = parse_frame_ranges(args.frames) if args.frames else None
 
     log_dir = Path(config["data_dirs"]["DIR_HOME"]) / "logs"
@@ -98,13 +89,13 @@ def main():
     log_file = log_dir / f"preprocess_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
                         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)])
-    logging.info("Dataset %s (%s); stages %s; frames %s; %d CPUs; skip existing: %s",
-                 config["dataset"]["NAME"], config["dataset"]["INI_PATH"], stages,
+    logging.info("Dataset %s (%s); frames %s; %d CPUs; skip existing: %s",
+                 config["dataset"]["NAME"], config["dataset"]["INI_PATH"],
                  args.frames or "all", ncpu, not args.overwrite)
 
     pipeline = pipeline_module.Pipeline(config, ncpu=ncpu, skip_existing=not args.overwrite,
                                         frame_ranges=frame_ranges, sample=args.sample, seed=args.seed)
-    pipeline.run(stages)
+    pipeline.run()
     logging.info("Done; log in %s", log_file)
 
 
