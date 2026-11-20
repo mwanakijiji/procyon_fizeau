@@ -29,6 +29,18 @@ def w(name):
     return os.path.join(WRITE, name, "")
 
 
+def dataset_config():
+    '''The real dataset config, with [pipeline] reset to the default full chain (so the tests do
+    not depend on the flags currently set in the .ini).'''
+    config = load_dataset_config("procyon_240131")
+    for s in STAGES:
+        config["pipeline"][s] = str(DEFAULT_FLAGS[s])
+    config["pipeline"]["START_STAGE"] = "slope"
+    config["pipeline"]["START_DIR"] = ""
+    config["pipeline"]["CLOBBER"] = "False"
+    return config
+
+
 # ---------- numbering and wiring ----------
 
 def test_default_numbering_and_inputs():
@@ -170,7 +182,7 @@ def test_clobber_refuses_to_delete_start_dir(tmp_path):
 
 def test_pipeline_clobber_deletes_only_later_outputs(tmp_path):
     '''End to end with the real dataset config, DIR_WRITE in tmp_path.'''
-    config = load_dataset_config("procyon_240131")
+    config = dataset_config()
     config["data_dirs"]["DIR_WRITE"] = str(tmp_path)
     config["pipeline"]["START_STAGE"] = "ramp"
     config["pipeline"]["CLOBBER"] = "True"
@@ -196,7 +208,7 @@ def test_pipeline_clobber_deletes_only_later_outputs(tmp_path):
 def test_from_config_start_dir_interpolates_data_dirs(tmp_path):
     '''START_DIR may use %(DIR_HOME)s etc. from [data_dirs], as the .ini comment suggests.'''
     (tmp_path / "00_slope_frames").mkdir()
-    config = load_dataset_config("procyon_240131")
+    config = dataset_config()
     config["data_dirs"]["DIR_HOME"] = str(tmp_path)
     config["pipeline"]["START_STAGE"] = "dark"
     config["pipeline"]["START_DIR"] = "%(DIR_HOME)s/00_slope_frames/"
@@ -205,7 +217,7 @@ def test_from_config_start_dir_interpolates_data_dirs(tmp_path):
 
 
 def test_from_config_reads_pipeline_section():
-    config = load_dataset_config("procyon_240131")
+    config = dataset_config()
     config["pipeline"]["dark"] = "False"
     config["pipeline"]["START_STAGE"] = "badpix"
     p = StagePlan.from_config(config, regions=["A"])

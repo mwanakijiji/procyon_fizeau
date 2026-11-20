@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 
-from modules.preprocessing.detector import N_CHANNELS, channels_PCA_cube
+from modules.preprocessing.detector import channel_layout, channels_PCA_cube
 from modules.preprocessing.frame_io import read_frame, write_frame
 from modules.preprocessing.star import find_airy_psf, star_nan_mask
 
@@ -69,19 +69,21 @@ class FuseRegions:
         logging.info("Writing out region-fused frame " + basename)
 
 
-def pca_backg_maker_channels_only(abs_pca_cube_file_name, shape):
+def pca_backg_maker_channels_only(abs_pca_cube_file_name, shape, n_channels, channel_width):
     '''
-    Write a simple PCA basis consisting of the 32 channel variations alone.
+    Write a simple PCA basis consisting of the readout-channel variations alone.
 
     INPUTS:
     - abs_pca_cube_file_name (str): Output FITS path
     - shape (tuple of int): Frame shape ``(ny, nx)``
+    - n_channels (int): Number of readout channels
+    - channel_width (int): Columns per channel
 
     OUTPUTS:
     - None
     '''
-    fits.writeto(filename=abs_pca_cube_file_name, data=channels_PCA_cube(shape), header=None,
-                 overwrite=True)
+    fits.writeto(filename=abs_pca_cube_file_name, data=channels_PCA_cube(shape, n_channels, channel_width),
+                 header=None, overwrite=True)
     logging.info("Wrote out background PCA cube, consisting of channel variations only, as " +
                  abs_pca_cube_file_name)
 
@@ -157,7 +159,7 @@ class BackgroundPCASubtSingle:
         # (find_airy_psf turns NaNs into zeros in place, so give it a copy)
         psf_loc = find_airy_psf(np.copy(sciImg)) # center of science PSF
         logging.info("PSF location in " + os.path.basename(abs_sci_name) + \
-              ": [" + str(psf_loc[0]) + ", " + str(psf_loc[1]) + "]")
+              ": [y,x]=[" + str(psf_loc[0]) + ", " + str(psf_loc[1]) + "]")
         psf_mask = star_nan_mask(np.shape(sciImg), psf_loc, self.psf_mask_radius)
 
         sciImg_masked = np.multiply(sciImg,psf_mask) # this is now the masked science frame
@@ -221,7 +223,7 @@ class BackgroundPCASubtSingle:
         - sci_img_pre (numpy array): Masked science frame before background subtraction
         - sci_img_post_all_subt (numpy array): Masked science frame after subtraction of the whole
           reconstructed background
-        - pca_spec (numpy array): PCA amplitudes; in the channel pass these are the 32 channel pedestals
+        - pca_spec (numpy array): PCA amplitudes; in the channel pass these are the channel pedestals
 
         OUTPUTS:
         - None
@@ -236,8 +238,9 @@ class BackgroundPCASubtSingle:
 
         axes[1].set_title('PCA Spec')
         axes[1].plot(pca_spec)
-        if len(pca_spec) > N_CHANNELS:
-            axes[1].axvline(N_CHANNELS, color='k', linestyle=':')
+        n_channels = channel_layout(self.config_data)[0]
+        if len(pca_spec) > n_channels:
+            axes[1].axvline(n_channels, color='k', linestyle=':')
 
         axes[2].set_title(f'Post-backgd subtraction\nMedian: {np.median(post)}\nStdev: {np.std(post)}')
         axes[2].hist(post, bins=200)

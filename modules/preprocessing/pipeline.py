@@ -36,6 +36,7 @@ import shutil
 from multiprocessing import get_context
 
 import numpy as np
+from astropy.io import fits
 
 from modules.shared.dataset import (
     blocks_csv_path, load_blocks, block_for_frame, frame_number, parse_regions,
@@ -45,7 +46,7 @@ from modules.preprocessing import make_slope_frames, dark_subtract, fix_bad_pix,
 from modules.preprocessing.background_pca import (
     BackgroundPCASubtSingle, FuseRegions, pca_backg_maker_channels_only,
 )
-from modules.preprocessing.detector import DetectorMask
+from modules.preprocessing.detector import DetectorMask, channel_layout
 from modules.preprocessing.frame_io import read_frame
 from modules.preprocessing.nod_subtract import NodSubtractSingle
 from modules.preprocessing.region_pca import train_region_pca
@@ -446,11 +447,21 @@ class Pipeline:
             logging.info(f"  no frames in {read_dir}")
             return
         cube = os.path.join(self.dirs["DIR_OTHER_FITS"], "background_PCA_vector_channel_vars_only.fits")
+        n_channels, channel_width = channel_layout(self.config)
+        shape = read_frame(files[0])[0].shape
+        expected = (n_channels,) + tuple(shape)
+        if os.path.exists(cube):
+            # rebuild if the frame shape or [detector] channel layout changed since it was made
+            hdr = fits.getheader(cube)
+            found = tuple(hdr[f"NAXIS{i}"] for i in range(hdr["NAXIS"], 0, -1))
+            if found != expected:
+                logging.info(f"  channel PCA cube {cube} has shape {found}, need {expected}; rebuilding")
+                os.remove(cube)
         if not os.path.exists(cube):
             os.makedirs(os.path.dirname(cube), exist_ok=True)
-            pca_backg_maker_channels_only(cube, read_frame(files[0])[0].shape)
+            pca_backg_maker_channels_only(cube, shape, n_channels, channel_width)
         fn = BackgroundPCASubtSingle(
-            self.pp.getint("N_PCA_CHANNEL"), pca_cube_file=cube, write_dir=out,
+            n_channels, pca_cube_file=cube, write_dir=out,  # one mode per readout channel
             mask=self.mask, config_data=self.config, psf_mask_radius=self.psf_radius,
             write_diagnostics=self.pp.getboolean("WRITE_BKG_DIAGNOSTICS"))
         self.map(fn, files, out)

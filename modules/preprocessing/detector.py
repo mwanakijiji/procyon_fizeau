@@ -2,9 +2,10 @@
 Detector helpers for the background stages: masking of unusable detector areas, the
 channel-pedestal basis, and PCA bases.
 
-LMIRcam reads out through 32 channels (NOUTPUTS = 32 in the headers), each 64 columns
-wide across the 2048 columns. The Procyon frames are the Center_512 subarray (512 x 2048),
-so the channel basis is built for whatever frame shape is passed in.
+The readout channel layout (``N_CHANNELS`` channels, each ``CHANNEL_WIDTH`` columns wide;
+for LMIRcam 32 x 64 = 2048, NOUTPUTS = 32 in the headers) is set in ``[detector]`` of the
+dataset config. The Procyon frames are the Center_512 subarray (512 x 2048), so the channel
+basis is built for whatever frame shape is passed in.
 
 The area masked by ``DetectorMask`` (edge width and boxes) is set in ``[detector_mask]``
 of the dataset config.
@@ -16,8 +17,20 @@ import numpy as np
 
 from modules.shared.dataset import _parse_slice
 
-N_CHANNELS = 32
-CHANNEL_WIDTH = 64
+
+def channel_layout(config):
+    '''
+    Readout channel layout from ``[detector]`` of the merged config.
+
+    INPUTS:
+    - config (ConfigParser): Merged config
+
+    OUTPUTS:
+    - n_channels (int): Number of readout channels (``N_CHANNELS``)
+    - channel_width (int): Columns per channel (``CHANNEL_WIDTH``)
+    '''
+    sec = config["detector"]
+    return sec.getint("N_CHANNELS"), sec.getint("CHANNEL_WIDTH")
 
 
 class DetectorMask:
@@ -87,22 +100,26 @@ class DetectorMask:
         return image
 
 
-def channels_PCA_cube(shape):
+def channels_PCA_cube(shape, n_channels, channel_width):
     '''
-    Basis representing the bias changes of the 32 detector channels (each 64 pix wide).
+    Basis representing the bias changes of the detector readout channels.
 
     INPUTS:
-    - shape (tuple of int): Frame shape ``(ny, nx)``; ``nx`` must be 32 x 64 = 2048
+    - shape (tuple of int): Frame shape ``(ny, nx)``; ``nx`` must be ``n_channels * channel_width``
+    - n_channels (int): Number of readout channels
+    - channel_width (int): Columns per channel
 
     OUTPUTS:
-    - channel_vars_PCA (numpy array): Cube (32, ny, nx); slice k is 1 in channel k, 0 elsewhere
+    - channel_vars_PCA (numpy array): Cube (n_channels, ny, nx); slice k is 1 in channel k,
+      0 elsewhere
     '''
     ny, nx = shape
-    if nx != N_CHANNELS * CHANNEL_WIDTH:
-        raise ValueError(f"Expected {N_CHANNELS * CHANNEL_WIDTH} columns, got {nx}")
-    channel_vars_PCA = np.zeros((N_CHANNELS, ny, nx))
-    for chNum in range(N_CHANNELS):
-        channel_vars_PCA[chNum, :, chNum * CHANNEL_WIDTH:(chNum + 1) * CHANNEL_WIDTH] = 1.
+    if nx != n_channels * channel_width:
+        raise ValueError(f"Expected {n_channels} x {channel_width} = {n_channels * channel_width} "
+                         f"columns ([detector] in the config), got {nx}")
+    channel_vars_PCA = np.zeros((n_channels, ny, nx))
+    for chNum in range(n_channels):
+        channel_vars_PCA[chNum, :, chNum * channel_width:(chNum + 1) * channel_width] = 1.
     return channel_vars_PCA
 
 

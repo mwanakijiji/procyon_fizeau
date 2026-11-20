@@ -120,6 +120,13 @@ def test_pipeline_ramp_reads_badpix_output(badpix_on):
     '''With the real dataset config, ramp reads badpix's output when badpix is enabled, and
     the dark-subtracted frames when it is not.'''
     config = load_dataset_config("procyon_240131")
+    # full default chain, independent of the flags currently set in the .ini
+    for s in ("slope", "dark", "ramp", "bkg_channel", "train_regions", "bkg_regions", "fuse",
+              "cutout", "register", "crop"):
+        config["pipeline"][s] = "True"
+    config["pipeline"]["bkg_nod"] = "False"
+    config["pipeline"]["START_STAGE"] = "slope"
+    config["pipeline"]["START_DIR"] = ""
     config["pipeline"]["badpix"] = str(badpix_on)
     plan = Pipeline(config).plan
     write = config["data_dirs"]["DIR_WRITE"]
