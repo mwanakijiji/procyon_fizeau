@@ -9,12 +9,12 @@
 # star_y, star_x: approximate star position on the 512 x 2048 frame, from the peak of
 #   box-smoothed dark-subtracted frames sampled across each block; the star is not
 #   seen in any sampled frame of 10501-11500
-# use: False marks frames that are not science (the darks). No other frames have
-#   been vetted yet. (Star flux in 11501-11800 drops to about the noise from ~11660 on,
-#   under clouds.)
-frame_start,frame_stop,target,filter,quadrant,star_y,star_x,use
-1,500,Procyon,Br-Alpha-On+ND1.0-T10,A,142,901,True
-501,10500,Procyon,Br-Alpha-On,A,138,915,True
-10501,11500,Procyon,Br-Alpha-On,,,,True
-11501,11800,Procyon,Br-Alpha-On,A,138,915,True
-11801,12800,dark,Blank,,,,False
+# type: sci (science), dark or cal (other calibration). No frames have been vetted yet;
+#   bad frames are marked by leaving them out of this file. (Star flux in 11501-11800
+#   drops to about the noise from ~11660 on, under clouds.)
+frame_start,frame_stop,target,filter,quadrant,star_y,star_x,type
+1,500,Procyon,Br-Alpha-On+ND1.0-T10,A,142,901,sci
+501,10500,Procyon,Br-Alpha-On,A,138,915,sci
+10501,11500,Procyon,Br-Alpha-On,,,,sci
+11501,11800,Procyon,Br-Alpha-On,A,138,915,sci
+11801,12800,dark,Blank,,,,dark

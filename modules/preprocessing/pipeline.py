@@ -22,9 +22,11 @@ set by the ``[pipeline]`` and ``[stage_dirs]`` config sections (see
 modules/preprocessing/stage_plan.py): each stage reads the output of the previous enabled
 stage, and outputs go to DIR_WRITE/<NN>_<stem>/, numbered over the enabled stages.
 
-slope, dark, badpix and ramp process every frame in their input directory. From bkg_nod
-on, only frames in blocks with use = True are processed; cutout, register and crop further
-skip blocks with no star on the detector (blank ``quadrant`` in the blocks CSV).
+Every frame stage processes every frame in its input directory, whatever its block ``type``
+(sci, dark, cal), and writes it to its usual output directory; only cutout, register and crop
+skip frames whose block has no star on the detector (blank ``quadrant`` in the blocks CSV, or
+no block at all). train_regions trains on the frames listed in TRAIN_FRAMES if set (whatever
+their type), or else picks science frames with no star near each region.
 
 Adapted from modules/preprocessing/pipeline.py of the AB Aur pipeline.
 """
@@ -40,13 +42,13 @@ from astropy.io import fits
 
 from modules.shared.dataset import (
     blocks_csv_path, load_blocks, block_for_frame, frame_number, parse_regions,
-    used_frame_numbers,
+    parse_frame_ranges, sci_frame_numbers,
 )
 from modules.preprocessing import make_slope_frames, dark_subtract, fix_bad_pix, ramp_removal
 from modules.preprocessing.background_pca import (
     BackgroundPCASubtSingle, FuseRegions, pca_backg_maker_channels_only,
 )
-from modules.preprocessing.detector import DetectorMask, channel_layout
+from modules.preprocessing.detector import DetectorMask, channel_layout, region_channel_modes
 from modules.preprocessing.frame_io import read_frame
 from modules.preprocessing.nod_subtract import NodSubtractSingle
 from modules.preprocessing.region_pca import train_region_pca
@@ -91,7 +93,7 @@ class Pipeline:
         - skip_existing (bool): Skip frames whose output file already exists
         - frame_ranges (list of tuple or None): Inclusive ``(lo, hi)`` frame ranges to process;
           ``None`` processes all frames
-        - sample (int or None): Process only this many randomly chosen good frames (use=True)
+        - sample (int or None): Process only this many randomly chosen science frames (type=sci)
           from within ``frame_ranges``, e.g. for quick tests. The choice depends only on the
           blocks CSV and ``seed``, so every stage gets the same frames. (train_regions and the
           opposite-nod frames of bkg_nod still use every available frame.)
@@ -110,7 +112,7 @@ class Pipeline:
         self.blocks = load_blocks(blocks_csv_path(config))
         self.sample_frames = None
         if sample:
-            candidates = sorted(n for n in used_frame_numbers(self.blocks) if self._in_ranges(n))
+            candidates = sorted(n for n in sci_frame_numbers(self.blocks) if self._in_ranges(n))
             rng = np.random.default_rng(seed)
             chosen = rng.choice(candidates, size=min(sample, len(candidates)), replace=False)
             self.sample_frames = set(int(n) for n in chosen)
@@ -118,6 +120,8 @@ class Pipeline:
         self.regions = parse_regions(config)
         self.mask = DetectorMask.from_config(config)
         self.sizes = [int(s) for s in config["dataset"]["CUTOUT_SIZES"].split(",")]
+        # frames to train the region PCA bases on (empty: choose starless science frames)
+        self.train_ranges = parse_frame_ranges(self.pp.get("TRAIN_FRAMES", fallback="") or "")
         self.psf_radius = self.pp.getfloat("PSF_MASK_RADIUS")
         self.halfbox = self.pp.getint("STAR_SEARCH_HALFBOX")
         # which stages run, and the directories they read and write
@@ -150,15 +154,14 @@ class Pipeline:
         '''
         return self._in_ranges(n) and (self.sample_frames is None or n in self.sample_frames)
 
-    def files(self, directory, used_only=False, all_frames=False, star_only=False):
+    def files(self, directory, all_frames=False, star_only=False):
         '''
-        Sorted ``<prefix>*.fits`` files in ``directory``, restricted to ``--frames`` and
-        ``--sample`` (unless ``all_frames``), if ``used_only`` to frames in blocks with
-        ``use = True``, and if ``star_only`` to frames in blocks with the star on the detector.
+        Sorted ``<prefix>*.fits`` files in ``directory`` (any block type), restricted to
+        ``--frames`` and ``--sample`` (unless ``all_frames``), and if ``star_only`` to frames in
+        blocks with the star on the detector.
 
         INPUTS:
         - directory (str): Directory to list
-        - used_only (bool): Keep only frames in blocks with ``use = True``
         - all_frames (bool): Ignore ``frame_ranges`` and ``sample``
         - star_only (bool): Keep only frames in blocks with a non-blank ``quadrant``
 
@@ -170,16 +173,15 @@ class Pipeline:
             n = frame_number(path, self.prefix)
             if n is None or (not all_frames and not self._selected(n)):
                 continue
-            if used_only or star_only:
-                b = block_for_frame(self.blocks, n)
-                if b is None or (used_only and not b["use"]) or (star_only and not block_has_star(b)):
-                    continue
+            if star_only and not block_has_star(block_for_frame(self.blocks, n)):
+                continue
             out.append(path)
         return out
 
     def files_by_frame(self, directory):
         '''
-        All used frames in ``directory`` (ignoring ``frame_ranges`` and ``sample``), by frame number.
+        All frames in ``directory`` (any block type, ignoring ``frame_ranges`` and ``sample``),
+        by frame number.
 
         INPUTS:
         - directory (str): Directory to list
@@ -187,7 +189,7 @@ class Pipeline:
         OUTPUTS:
         - files (dict): Map of frame number (int) to FITS path (str)
         '''
-        return {frame_number(p, self.prefix): p for p in self.files(directory, used_only=True, all_frames=True)}
+        return {frame_number(p, self.prefix): p for p in self.files(directory, all_frames=True)}
 
     def _todo(self, files, write_dir):
         '''
@@ -412,7 +414,7 @@ class Pipeline:
 
     def stage_bkg_nod(self):
         '''
-        Subtract the median of nearby opposite-nod frames (used frames only).
+        Subtract the median of nearby opposite-nod frames.
 
         INPUTS:
         - None
@@ -427,11 +429,11 @@ class Pipeline:
                                blocks=self.blocks, n_frames=self.pp.getint("NOD_N_FRAMES"),
                                psf_radius=self.psf_radius, halfbox=self.halfbox, prefix=self.prefix)
         # contiguous chunks, so each worker's cache of opposite-nod frames is reused
-        self.map(fn, self.files(read_dir, used_only=True), out, chunksize=64)
+        self.map(fn, self.files(read_dir), out, chunksize=64)
 
     def stage_bkg_channel(self):
         '''
-        Subtract channel-pedestal PCA backgrounds (used frames only). Builds the channel PCA
+        Subtract channel-pedestal PCA backgrounds (all frames). Builds the channel PCA
         cube in DIR_OTHER_FITS, at the shape of the input frames, if missing.
 
         INPUTS:
@@ -442,7 +444,7 @@ class Pipeline:
         '''
         logging.info('Subtracting channel-pedestal PCA backgrounds...')
         read_dir, out = self.plan.in_dir("bkg_channel"), self.plan.out_dir("bkg_channel")
-        files = self.files(read_dir, used_only=True)
+        files = self.files(read_dir)
         if not files:
             logging.info(f"  no frames in {read_dir}")
             return
@@ -487,17 +489,44 @@ class Pipeline:
                 logging.info(f"  region {name}: basis exists, skipping ({out})")
                 continue
             if files is None:
-                files = self.files_by_frame(self.plan.in_dir("train_regions"))
+                files = self.training_files()
             train_region_pca(files, self.blocks, name, region,
                              n_frames=self.pp.getint("N_TRAIN_FRAMES"),
                              n_pca=self.pp.getint("N_PCA_REGION"),
                              psf_radius=self.psf_radius, out_path=out, mask=self.mask,
-                             halfbox=self.halfbox)
+                             halfbox=self.halfbox, restrict_to_sci=not self.train_ranges)
+
+    def training_files(self):
+        '''
+        Candidate training frames for train_regions, from its input directory (ignoring
+        ``--frames`` and ``--sample``): if TRAIN_FRAMES is set, exactly the frames it lists,
+        whatever their block type; otherwise every frame (train_region_pca then picks the
+        starless science frames).
+
+        INPUTS:
+        - None
+
+        OUTPUTS:
+        - files (dict): Map of frame number (int) to FITS path (str)
+        '''
+        read_dir = self.plan.in_dir("train_regions")
+        files = self.files_by_frame(read_dir)
+        if not self.train_ranges:
+            return files
+        wanted = {n for lo, hi in self.train_ranges for n in range(lo, hi + 1)}
+        chosen = {n: p for n, p in files.items() if n in wanted}
+        missing = len(wanted) - len(chosen)
+        logging.info(f"  training on TRAIN_FRAMES: {len(chosen)} frames found in {read_dir}"
+                     + (f" ({missing} listed frames missing there)" if missing else ""))
+        return chosen
 
     def stage_bkg_regions(self):
         '''
-        Subtract each region's PCA background (one output directory per region; used frames
-        only). The region bases must exist (train_regions).
+        Subtract each region's PCA background (one output directory per region,
+        all frames). The region bases must exist (train_regions). With JOINT_CHANNEL_FIT, the
+        channel-pedestal modes of the channels overlapping the region are fitted jointly with
+        the region's PCA modes (one least-squares solve), so that the PCA modes cannot leave
+        per-channel offsets behind.
 
         INPUTS:
         - None
@@ -506,17 +535,25 @@ class Pipeline:
         - None
         '''
         logging.info('Subtracting region PCA backgrounds...')
-        files = self.files(self.plan.in_dir("bkg_regions"), used_only=True)
-        for name in self.regions:
+        files = self.files(self.plan.in_dir("bkg_regions"))
+        joint = self.pp.getboolean("JOINT_CHANNEL_FIT", fallback=False)
+        for name, region in self.regions.items():
             cube = self.region_cube_path(name)
             if not os.path.exists(cube):
                 raise FileNotFoundError(f"PCA basis for region {name} not found: {cube}. "
                                         "Run the train_regions stage first.")
-            logging.info(f"  region {name}")
+            extra = None
+            if joint:
+                hdr = fits.getheader(cube)
+                shape = (hdr["NAXIS2"], hdr["NAXIS1"])
+                extra = region_channel_modes(shape, region, *channel_layout(self.config))
+                logging.info(f"  region {name} (jointly with {len(extra)} channel-pedestal modes)")
+            else:
+                logging.info(f"  region {name}")
             fn = BackgroundPCASubtSingle(
                 self.pp.getint("N_PCA_REGION"), pca_cube_file=cube, write_dir=self.region_dir(name),
                 mask=self.mask, config_data=self.config, psf_mask_radius=self.psf_radius,
-                write_diagnostics=self.pp.getboolean("WRITE_BKG_DIAGNOSTICS"))
+                write_diagnostics=self.pp.getboolean("WRITE_BKG_DIAGNOSTICS"), extra_modes=extra)
             self.map(fn, files, self.region_dir(name))
             del fn
 
@@ -534,7 +571,7 @@ class Pipeline:
         logging.info('Fusing background-subtracted regions into whole frames...')
         region_dirs = [self.plan.in_dir("fuse", region=name) for name in self.regions]
         # frames present in every region directory
-        names = set.intersection(*[set(map(os.path.basename, self.files(d, used_only=True))) for d in region_dirs])
+        names = set.intersection(*[set(map(os.path.basename, self.files(d))) for d in region_dirs])
         files = [os.path.join(region_dirs[0], n) for n in sorted(names)]
         out = self.plan.out_dir("fuse")
         fn = FuseRegions(write_dir=out, region_dirs=region_dirs)
@@ -542,7 +579,7 @@ class Pipeline:
 
     def stage_cutout(self):
         '''
-        Cut odd-sized cutouts centered on the star (first size in CUTOUT_SIZES; used frames with
+        Cut odd-sized cutouts centered on the star (first size in CUTOUT_SIZES; frames with
         the star on the detector).
 
         INPUTS:
@@ -554,7 +591,7 @@ class Pipeline:
         logging.info('Making initial cutouts centered on the star...')
         fn = CutoutSingle(write_dir=self.cutout_dir(), blocks=self.blocks, prefix=self.prefix,
                           size=self.sizes[0], halfbox=self.halfbox)
-        self.map(fn, self.files(self.plan.in_dir("cutout"), used_only=True, star_only=True),
+        self.map(fn, self.files(self.plan.in_dir("cutout"), star_only=True),
                  self.cutout_dir())
 
     def stage_register(self):
@@ -576,7 +613,7 @@ class Pipeline:
         write_dir = self.registered_dir(self.sizes[0])
         os.makedirs(write_dir, exist_ok=True)
         by_block = {}
-        for path in self.files(self.plan.in_dir("register", size=self.sizes[0]), used_only=True, star_only=True):
+        for path in self.files(self.plan.in_dir("register", size=self.sizes[0]), star_only=True):
             b = block_for_frame(self.blocks, frame_number(path, self.prefix))
             by_block.setdefault(b.name, []).append(path)
         jobs = []
@@ -638,6 +675,6 @@ class Pipeline:
         src = self.plan.in_dir("crop", size=self.sizes[0])
         for size in self.sizes[1:]:
             dst = self.registered_dir(size)
-            names = {os.path.basename(p) for p in self.files(src, used_only=True, star_only=True)}
+            names = {os.path.basename(p) for p in self.files(src, star_only=True)}
             written = crop_fits_dir(src, dst, size, skip_existing=self.skip_existing, only=names)
             logging.info(f"  cropped {len(written)} frames to {size} pix -> {dst}")

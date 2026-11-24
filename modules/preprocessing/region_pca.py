@@ -7,6 +7,10 @@ block has no star on the detector (blank ``quadrant``, e.g. the off-source nod),
 background only. The regions and the star positions come from the dataset config and the
 blocks CSV.
 
+By default only science frames (block ``type = sci``) are candidates. With
+``restrict_to_sci=False`` (used when the frames are listed explicitly in TRAIN_FRAMES, e.g.
+darks) every frame passed in is a candidate, whatever its type or block.
+
 Adapted from modules/preprocessing/region_pca.py of the AB Aur pipeline.
 """
 
@@ -16,7 +20,7 @@ import os
 import numpy as np
 from astropy.io import fits
 
-from modules.shared.dataset import block_for_frame
+from modules.shared.dataset import block_for_frame, is_sci
 from modules.preprocessing.detector import PCA_basis
 from modules.preprocessing.star import locate_star, block_hint, block_has_star
 
@@ -45,7 +49,7 @@ def distance_to_region(point, region, shape):
 
 
 def train_region_pca(files_by_frame, blocks, region_name, region, n_frames, n_pca,
-                     psf_radius, out_path, mask, halfbox=50, seed=0):
+                     psf_radius, out_path, mask, halfbox=50, seed=0, restrict_to_sci=True):
     '''
     Build and write the PCA basis for one region.
 
@@ -61,6 +65,9 @@ def train_region_pca(files_by_frame, blocks, region_name, region, n_frames, n_pc
     - mask (DetectorMask): Mask of the unusable detector areas
     - halfbox (int): Half-width of the star search box around the blocks-CSV position
     - seed (int): Random seed for choosing the training frames
+    - restrict_to_sci (bool): True: only frames in ``type = sci`` blocks whose star is not in
+      this region. False: every frame in ``files_by_frame`` (frames in blocks with a star are
+      still skipped if the star is too close to the region)
 
     OUTPUTS:
     - used (list of str): Training frames used
@@ -68,8 +75,10 @@ def train_region_pca(files_by_frame, blocks, region_name, region, n_frames, n_pc
     candidates = []
     for n, path in sorted(files_by_frame.items()):
         b = block_for_frame(blocks, n)
-        if b is None or not b["use"] or b["quadrant"] == region_name:
+        if restrict_to_sci and not is_sci(b):
             continue
+        if b is not None and b["quadrant"] == region_name:
+            continue  # the star is in this region
         candidates.append((path, block_hint(b), block_has_star(b)))
     if not candidates:
         raise RuntimeError(f"No training frames for region {region_name}")

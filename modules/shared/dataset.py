@@ -27,17 +27,18 @@ A dataset ``<name>`` is described by two files in ``scripts/config_files/dataset
                  not on the detector (e.g. an off-source nod)
    star_y        approximate star row on the detector (may be blank)
    star_x        approximate star column on the detector (may be blank)
-   use           ``True`` for good frames; ``False`` for bad frames
+   type          frame type: ``sci`` (science), ``dark`` or ``cal`` (other
+                 calibration)
    ============  ==========================================================
 
-   For example, the row ``501,10500,Procyon,Br-Alpha-On,A,138,915,True`` says that
-   frames 501 to 10500 are good frames of Procyon in Br-Alpha-On, with the star near
+   For example, the row ``501,10500,Procyon,Br-Alpha-On,A,138,915,sci`` says that
+   frames 501 to 10500 are science frames of Procyon in Br-Alpha-On, with the star near
    detector pixel (y, x) = (138, 915) in region A.
 
-   Blocks must not overlap. A range of bad frames inside a block gets its own
-   row with ``use = False``, and the good block is split around it. Frames that
-   are in no row at all (e.g. calibration frames) are ignored by every stage that
-   uses the blocks.
+   Blocks must not overlap. Bad frames are left out of the CSV (a block with bad
+   frames inside it is split around them). Frames that are in no row at all are
+   ignored by every stage that uses the blocks (cutout, register, crop, nod
+   subtraction, automatic region-PCA training frame selection).
 
    Everything that depends on the frame-number range (cutout centers, which region
    holds the PSF, bad frames) is read from here.
@@ -56,7 +57,9 @@ BASE_CONFIG = CONFIG_DIR / "preprocess.ini"
 DATASETS_DIR = CONFIG_DIR / "datasets"
 
 BLOCK_COLUMNS = ["frame_start", "frame_stop", "target", "filter", "quadrant",
-                 "star_y", "star_x", "use"]
+                 "star_y", "star_x", "type"]
+# allowed values of the ``type`` column
+BLOCK_TYPES = ("sci", "dark", "cal")
 
 
 def dataset_ini_path(dataset):
@@ -113,26 +116,6 @@ def blocks_csv_path(config):
     return csv
 
 
-def _parse_bool(value):
-    '''
-    Parse a boolean from a CSV cell.
-
-    INPUTS:
-    - value (object): bool, or a string such as ``true``/``false``, ``1``/``0``, ``yes``/``no``
-
-    OUTPUTS:
-    - flag (bool): Parsed value (raises ValueError if it does not parse)
-    '''
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in ("true", "1", "yes", "y"):
-        return True
-    if s in ("false", "0", "no", "n"):
-        return False
-    raise ValueError(f"Cannot parse boolean from {value!r}")
-
-
 def load_blocks(csv):
     '''
     Read and validate a blocks CSV (see the module docstring for what a block is).
@@ -142,10 +125,10 @@ def load_blocks(csv):
 
     OUTPUTS:
     - blocks (DataFrame): One row per block, sorted by ``frame_start``; ``star_y``/``star_x``
-      are nullable integers, ``use`` is boolean
+      are nullable integers, ``type`` is one of ``BLOCK_TYPES`` (lower case)
     '''
     blocks = pd.read_csv(csv, comment="#", skipinitialspace=True,
-                         dtype={"target": str, "filter": str, "quadrant": str})
+                         dtype={"target": str, "filter": str, "quadrant": str, "type": str})
     missing = [c for c in BLOCK_COLUMNS if c not in blocks.columns]
     if missing:
         raise ValueError(f"{csv}: missing columns {missing}")
@@ -155,9 +138,12 @@ def load_blocks(csv):
     blocks["frame_stop"] = blocks["frame_stop"].astype(int)
     blocks["star_y"] = pd.to_numeric(blocks["star_y"]).astype("Int64")
     blocks["star_x"] = pd.to_numeric(blocks["star_x"]).astype("Int64")
-    blocks["use"] = blocks["use"].map(_parse_bool)
-    for col in ("target", "filter", "quadrant"):
+    for col in ("target", "filter", "quadrant", "type"):
         blocks[col] = blocks[col].fillna("").str.strip()
+    blocks["type"] = blocks["type"].str.lower()
+    bad = sorted(set(blocks["type"]) - set(BLOCK_TYPES))
+    if bad:
+        raise ValueError(f"{csv}: unknown block type(s) {bad}; allowed: {list(BLOCK_TYPES)}")
     blocks = blocks.sort_values("frame_start").reset_index(drop=True)
 
     if (blocks["frame_stop"] < blocks["frame_start"]).any():
@@ -166,9 +152,9 @@ def load_blocks(csv):
     if overlap.any():
         i = int(np.argmax(overlap))
         raise ValueError(f"{csv}: blocks overlap at rows {i} and {i + 1}")
-    used = blocks[blocks["use"]]
-    if (used["target"] == "").any() or (used["filter"] == "").any():
-        raise ValueError(f"{csv}: every block with use=True needs a target and filter")
+    sci = blocks[blocks["type"] == "sci"]
+    if (sci["target"] == "").any() or (sci["filter"] == "").any():
+        raise ValueError(f"{csv}: every block with type=sci needs a target and filter")
     return blocks
 
 
@@ -209,9 +195,22 @@ def frame_number(file_name, prefix):
         return None
 
 
-def used_frame_numbers(blocks):
+def is_sci(block):
     '''
-    Set of all frame numbers in blocks with ``use = True``.
+    Whether a block (row from ``block_for_frame``, or None) holds science frames.
+
+    INPUTS:
+    - block (Series or None): Block row
+
+    OUTPUTS:
+    - sci (bool): True if the block exists and has ``type = sci``
+    '''
+    return block is not None and block["type"] == "sci"
+
+
+def sci_frame_numbers(blocks):
+    '''
+    Set of all frame numbers in blocks with ``type = sci``.
 
     INPUTS:
     - blocks (DataFrame): Output of ``load_blocks``
@@ -220,7 +219,7 @@ def used_frame_numbers(blocks):
     - nums (set of int): Frame numbers
     '''
     nums = set()
-    for row in blocks[blocks["use"]].itertuples():
+    for row in blocks[blocks["type"] == "sci"].itertuples():
         nums.update(range(int(row.frame_start), int(row.frame_stop) + 1))
     return nums
 
@@ -267,6 +266,24 @@ def parse_regions(config):
         ys, xs = value.split(",")
         regions[name] = (_parse_slice(ys), _parse_slice(xs))
     return regions
+
+
+def frame_subset(config):
+    '''
+    Frames to process, from ``[dataset] FRAME_SUBSET``: ``all`` (or blank / missing) for every
+    frame in the input directory of the first stage that runs, else comma-separated frame
+    numbers and ``lo-hi`` ranges (``parse_frame_ranges``).
+
+    INPUTS:
+    - config (ConfigParser): Merged config
+
+    OUTPUTS:
+    - ranges (list of tuple or None): Inclusive ``(lo, hi)`` ranges, or None for all frames
+    '''
+    text = config["dataset"].get("FRAME_SUBSET", fallback="").strip()
+    if text.lower() in ("", "all"):
+        return None
+    return parse_frame_ranges(text)
 
 
 def parse_frame_ranges(text):

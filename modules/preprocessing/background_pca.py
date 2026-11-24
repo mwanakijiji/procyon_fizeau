@@ -102,13 +102,15 @@ class BackgroundPCASubtSingle:
     '''
 
     def __init__(self, n_PCA, pca_cube_file, write_dir, mask, config_data,
-                 psf_mask_radius=150., write_diagnostics=False):
+                 psf_mask_radius=150., write_diagnostics=False, extra_modes=None):
         '''
         Read the PCA component cube and mask the bad detector regions in it.
 
         INPUTS:
-        - n_PCA (int): Number of components to reconstruct the background with
+        - n_PCA (int): Number of components of ``pca_cube_file`` to reconstruct the background with
         - pca_cube_file (str): PCA cube
+        - extra_modes (numpy array or None): Further modes (k, ny, nx), e.g. channel pedestals,
+          fitted jointly with the first ``n_PCA`` modes of the cube (one least-squares solve)
         - write_dir (str): Directory for the background-subtracted frames (with trailing slash)
         - mask (DetectorMask): Mask of the unusable detector areas
         - config_data (ConfigParser): Configuration data
@@ -127,7 +129,12 @@ class BackgroundPCASubtSingle:
         self.write_diagnostics = write_diagnostics
         self.cube_tag = os.path.splitext(os.path.basename(pca_cube_file))[0]
 
-        self.pca_cube = fits.getdata(pca_cube_file, 0, header=False)
+        self.pca_cube = fits.getdata(pca_cube_file, 0, header=False)[:n_PCA]
+        if extra_modes is not None and len(extra_modes):
+            self.pca_cube = np.concatenate([np.asarray(extra_modes, dtype=np.float32),
+                                            self.pca_cube.astype(np.float32)])
+            self.n_PCA = len(self.pca_cube)
+            self.cube_tag += f"+{len(extra_modes)}extra"
 
         # apply mask over unusable detector regions to PCA cube
         # (N.b. otherwise the PCA won't converge!)
@@ -172,7 +179,8 @@ class BackgroundPCASubtSingle:
         ## masked science frame (equivalent to masking the PCA cube, without copying it)
         pca_1ds = np.reshape(self.pca_cube[0:self.n_PCA,:,:], (self.n_PCA, -1))
         sci_masked_1d = np.ravel(sciImg_psf_masked)
-        idx = np.logical_and(np.isfinite(pca_1ds[0,:]), np.isfinite(sci_masked_1d))
+        # (pixels finite in every mode, since jointly fitted modes may come from different cubes)
+        idx = np.logical_and(np.all(np.isfinite(pca_1ds), axis=0), np.isfinite(sci_masked_1d))
 
         # the vector of component amplitudes
         soln_vector = np.linalg.lstsq(pca_1ds[:,idx].astype(np.float64).T, sci_masked_1d[idx], rcond=None)

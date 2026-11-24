@@ -91,8 +91,9 @@ class StagePlan:
         for stage, needed in _REQUIRES.items():
             if self.flags[stage] and not self.flags[needed]:
                 raise ValueError(f"stage {stage!r} needs stage {needed!r} to be enabled too")
-        # bkg_regions writes one directory per region, which only fuse can read
-        if self.flags["bkg_regions"]:
+        # bkg_regions writes one directory per region, which only fuse can read (with a single
+        # region, the next stage reads that region's directory directly, so fuse is optional)
+        if self.flags["bkg_regions"] and len(self.regions) != 1:
             later = [s for s in FRAME_STAGES[FRAME_STAGES.index("bkg_regions") + 1:] if self.flags[s]]
             if later and later[0] != "fuse":
                 raise ValueError("stage 'bkg_regions' must be followed by 'fuse' (stage "
@@ -192,12 +193,16 @@ class StagePlan:
         INPUTS:
         - stage (str): Stage name
         - **fmt: ``region=`` / ``size=`` for directories with ``{region}`` / ``{size}``
-          (e.g. ``fuse`` reads one directory per region; ``crop`` reads the first size)
+          (e.g. ``fuse`` reads one directory per region; ``crop`` reads the first size).
+          With a single region, ``region`` defaults to it.
 
         OUTPUTS:
         - path (str): The directory
         '''
         producer = self._producer(stage)
+        if len(self.regions) == 1 and "region" not in fmt:
+            # a single region: a stage after bkg_regions reads that region's directory
+            fmt = dict(fmt, region=self.regions[0])
         if producer == "START_DIR":
             return self.start_dir.format(**fmt)
         if producer == "RAW":

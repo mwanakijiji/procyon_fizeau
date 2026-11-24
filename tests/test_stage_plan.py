@@ -144,6 +144,21 @@ def test_validation_errors(kwargs, match):
         make_plan(**kwargs)
 
 
+def test_single_region_allows_skipping_fuse():
+    '''With one region, the stage after bkg_regions reads that region's directory directly.'''
+    flags = dict(DEFAULT_FLAGS, fuse=False)
+    p = StagePlan(flags, STEMS, dir_write=WRITE, dir_raw=RAW, start_stage="slope",
+                  regions=["A"], sizes=[257, 129])
+    assert p.out_dir("bkg_regions", region="A") == w("05_pcab_subted_higher_order_region_A")
+    assert p.in_dir("cutout") == w("05_pcab_subted_higher_order_region_A")
+    assert p.out_dir("cutout", size=257) == w("06_cutouts_257")
+    # fuse may still be on with one region
+    p = StagePlan(DEFAULT_FLAGS, STEMS, dir_write=WRITE, dir_raw=RAW, start_stage="slope",
+                  regions=["A"], sizes=[257, 129])
+    assert p.in_dir("fuse") == w("05_pcab_subted_higher_order_region_A")
+    assert p.in_dir("cutout") == w("06_regions_recombined")
+
+
 def test_flags_must_cover_every_stage():
     flags = dict(DEFAULT_FLAGS)
     del flags["dark"]

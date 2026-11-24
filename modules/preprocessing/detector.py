@@ -123,6 +123,30 @@ def channels_PCA_cube(shape, n_channels, channel_width):
     return channel_vars_PCA
 
 
+def region_channel_modes(shape, region, n_channels, channel_width):
+    '''
+    Channel-pedestal modes (``channels_PCA_cube``) restricted to one detector region, for a
+    joint fit with that region's PCA basis: NaN outside the region (like the region basis),
+    and only the channels that overlap the region.
+
+    INPUTS:
+    - shape (tuple of int): Frame shape ``(ny, nx)``
+    - region (tuple of slice): ``(y_slice, x_slice)`` of the region
+    - n_channels (int): Number of readout channels
+    - channel_width (int): Columns per channel
+
+    OUTPUTS:
+    - modes (numpy array): Cube (n_overlapping_channels, ny, nx), float32
+    '''
+    cube = channels_PCA_cube(shape, n_channels, channel_width).astype(np.float32)
+    inside = np.zeros(shape, dtype=bool)
+    inside[tuple(region)] = True
+    keep = [k for k in range(n_channels) if np.any(cube[k][inside] != 0)]
+    cube = cube[keep]
+    cube[:, ~inside] = np.nan
+    return cube
+
+
 def PCA_basis(training_cube_masked_weird, n_PCA):
     '''
     PCA basis of a training cube, using only the pixels finite in its first frame (randomized

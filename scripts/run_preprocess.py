@@ -11,7 +11,9 @@ Examples:
     # the stages enabled in the config, from START_STAGE on
     python scripts/run_preprocess.py --dataset procyon_240131
 
-    # the same, on one block from each nod
+    # (which frames are processed: [dataset] FRAME_SUBSET of the .ini, 'all' or frame ranges)
+
+    # the same, on one block from each nod (overriding FRAME_SUBSET)
     python scripts/run_preprocess.py --dataset procyon_240131 --frames 501-600,10501-10600
 
     # the same, on 5 random good frames
@@ -64,7 +66,8 @@ def main():
     parser.add_argument("--dataset", required=True,
                         help="dataset name in scripts/config_files/datasets/ (e.g. procyon_240131) or path to its .ini")
     parser.add_argument("--frames", default=None,
-                        help="restrict to frame ranges, e.g. 501-600,10501-10600 (default: all)")
+                        help="restrict to frame ranges, e.g. 501-600,10501-10600 (overrides "
+                             "[dataset] FRAME_SUBSET of the dataset .ini; default: FRAME_SUBSET)")
     parser.add_argument("--sample", type=int, default=None,
                         help="process only N random good frames from within --frames (same frames "
                              "for every stage; for quick tests)")
@@ -78,11 +81,17 @@ def main():
 
     # load these inside main(), after BLAS linalg thread limits are set
     # (so each worker process does not grab every core for itself)
-    from modules.shared.dataset import load_dataset_config, parse_frame_ranges
+    from modules.shared.dataset import load_dataset_config, parse_frame_ranges, frame_subset
     from modules.preprocessing import pipeline as pipeline_module
 
     config = load_dataset_config(args.dataset)
-    frame_ranges = parse_frame_ranges(args.frames) if args.frames else None
+    # --frames overrides [dataset] FRAME_SUBSET
+    if args.frames:
+        frames_text = args.frames
+        frame_ranges = parse_frame_ranges(args.frames)
+    else:
+        frames_text = config["dataset"].get("FRAME_SUBSET", fallback="").strip() or "all"
+        frame_ranges = frame_subset(config)
 
     log_dir = Path(config["data_dirs"]["DIR_HOME"]) / "logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -91,7 +100,7 @@ def main():
                         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)])
     logging.info("Dataset %s (%s); frames %s; %d CPUs; skip existing: %s",
                  config["dataset"]["NAME"], config["dataset"]["INI_PATH"],
-                 args.frames or "all", ncpu, not args.overwrite)
+                 frames_text, ncpu, not args.overwrite)
 
     pipeline = pipeline_module.Pipeline(config, ncpu=ncpu, skip_existing=not args.overwrite,
                                         frame_ranges=frame_ranges, sample=args.sample, seed=args.seed)

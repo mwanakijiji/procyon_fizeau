@@ -18,7 +18,7 @@ from collections import OrderedDict
 
 import numpy as np
 
-from modules.shared.dataset import block_for_frame
+from modules.shared.dataset import block_for_frame, is_sci
 from modules.preprocessing.frame_io import read_frame, write_frame
 from modules.preprocessing.star import locate_star, block_hint, block_has_star, star_nan_mask
 
@@ -58,7 +58,7 @@ class NodSubtractSingle:
         self._groups = {}
         for n in sorted(files_by_frame):
             b = block_for_frame(blocks, n)
-            if b is None or not b["use"]:
+            if not is_sci(b):
                 continue
             self._groups.setdefault((b["target"], b["filter"], b["quadrant"]), []).append(n)
 
@@ -73,6 +73,9 @@ class NodSubtractSingle:
         - nums (list of int): Sorted frame numbers (empty if there are none)
         '''
         b = block_for_frame(self.blocks, frame_num)
+        if not is_sci(b):
+            # darks, calibrations and frames in no block have no opposite nod
+            return []
         others = [n for (t, f, q), nums in self._groups.items()
                   if t == b["target"] and f == b["filter"] and q != b["quadrant"]
                   for n in nums]
